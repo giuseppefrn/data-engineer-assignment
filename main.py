@@ -36,6 +36,20 @@ def to_snake_case(name: str) -> str:
     return snake_case_name
 
 
+def add_metadata_columns(df: DataFrame, file_path: str) -> DataFrame:
+    """
+    Add metadata columns to a DataFrame
+    :param df:
+    :param file_path:
+    :return:
+    """
+    logger.info("Adding metadata columns: file_path, execution_datetime...")
+    execution_datetime = datetime.now().isoformat()
+    return df.withColumn("file_path", F.lit(file_path)).withColumn(
+        "execution_datetime", F.lit(execution_datetime)
+    )
+
+
 def process_bronze_data(df: DataFrame, output_path: str) -> DataFrame:
     """
     Process the raw data to create the bronze table
@@ -44,11 +58,7 @@ def process_bronze_data(df: DataFrame, output_path: str) -> DataFrame:
     :param output_path: Path to save the dataset
     :return:
     """
-    logger.info("Adding metadata columns: file_path, execution_datetime...")
-    execution_datetime = datetime.now().isoformat()
-    bronze_df = df.withColumn("file_path", F.lit(args.input_path)).withColumn(
-        "execution_datetime", F.lit(execution_datetime)
-    )
+    bronze_df = add_metadata_columns(df, output_path)
 
     logger.info("Renaming columns to snake_case...")
     snake_case_columns = [to_snake_case(column) for column in bronze_df.columns]
@@ -89,8 +99,10 @@ def process_silver_data(bronze_df: DataFrame, output_path: str) -> DataFrame:
     """
     logger.info("Starting Silver layer processing...")
 
+    silver_df = add_metadata_columns(bronze_df, output_path)
+
     # Convert `ship_date` to date format
-    silver_df = bronze_df.withColumn("ship_date", F.to_date("ship_date", "dd/MM/yyyy"))
+    silver_df = silver_df.withColumn("ship_date", F.to_date("ship_date", "dd/MM/yyyy"))
 
     # Drop rows with NULLs in critical columns
     silver_df = silver_df.dropna(
@@ -136,8 +148,12 @@ def process_sales_data(
     """
     logger.info("Extracting Sales dataset from Silver layer...")
 
+    sales_df = add_metadata_columns(silver_df, output_path)
+
     # Select relevant columns for the Sales dataset
-    sales_df = silver_df.select(columns + ["year", "month", "day"])
+    sales_df = sales_df.select(
+        columns + ["year", "month", "day", "execution_datetime", "file_path"]
+    )
 
     # Write the dataset to the Gold layer partitioned by year, month, and day
     logger.info(f"Writing Sales dataset to {output_path}...")
@@ -158,11 +174,17 @@ def process_gold_customer(
     :param output_path: Path to save the dataset
     :return: None
     """
+    logger.info("Extracting Customer dataset from Silver layer...")
+
+    customer_df = add_metadata_columns(silver_df, output_path)
+
     # Define the reference date (dataset's latest day)
     reference_date = F.lit("2018-12-30").cast("date")
 
     # Calculate quantities for different time ranges
-    customer_df = silver_df.groupBy(columns).agg(
+    customer_df = customer_df.groupBy(
+        columns + ["execution_datetime", "file_path"]
+    ).agg(
         F.countDistinct("order_id").alias("total_quantity_of_orders"),
         F.sum(
             F.when(F.datediff(reference_date, F.col("order_date")) <= 30, 1).otherwise(
@@ -191,6 +213,15 @@ def main(args: argparse.Namespace) -> None:
     :param args: argparse.Namespace
     :return: None
     """
+    sales_columns = ["order_id", "order_date", "ship_date", "ship_mode", "city"]
+    customer_columns = [
+        "customer_id",
+        "customer_first_name",
+        "customer_last_name",
+        "segment",
+        "country",
+    ]
+
     try:
         logger.info(f"Reading data from {args.input_path}...")
         df = spark.read.csv(args.input_path, header=True, inferSchema=True)
@@ -204,17 +235,9 @@ def main(args: argparse.Namespace) -> None:
         silver_df = process_silver_data(bronze_df, "outputs/silver")
 
         logger.info("Processing sales data...")
-        sales_columns = ["order_id", "order_date", "ship_date", "ship_mode", "city"]
         process_sales_data(silver_df, sales_columns, "outputs/gold/sales")
 
         logger.info("Processing customer data...")
-        customer_columns = [
-            "customer_id",
-            "customer_first_name",
-            "customer_last_name",
-            "segment",
-            "country",
-        ]
         process_gold_customer(silver_df, customer_columns, "outputs/gold/customer")
 
         logger.info("Process completed successfully.")
