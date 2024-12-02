@@ -2,6 +2,7 @@ import argparse
 import logging
 import re
 from datetime import datetime
+from typing import Union
 
 import pyspark.sql.functions as F
 from pyspark.sql import DataFrame, SparkSession
@@ -50,6 +51,26 @@ def add_metadata_columns(df: DataFrame, file_path: str) -> DataFrame:
     )
 
 
+def write_df(
+    output_path: str, df: DataFrame, method: str, partition_by: Union[list[str], None]
+) -> None:
+    """
+    Write a DataFrame to a given output path partitioned by year, month, and day
+    :param output_path:
+    :param df:
+    :param method:
+    :param partition_by:
+    :return:
+    """
+    logger.info(
+        f"Writing DataFrame to {output_path}, method: {method}, partition_by: {partition_by}..."
+    )
+    if partition_by is not None:
+        df.write.mode(method).partitionBy(partition_by).parquet(output_path)
+    else:
+        df.write.mode(method).parquet(output_path)
+
+
 def process_bronze_data(df: DataFrame, output_path: str) -> DataFrame:
     """
     Process the raw data to create the bronze table
@@ -81,12 +102,7 @@ def process_bronze_data(df: DataFrame, output_path: str) -> DataFrame:
         .withColumn("day", F.dayofmonth(F.col("order_date")))
     )
 
-    logger.info("Saving data partitioned by year, month, and day...")
-    bronze_df.write.mode("overwrite").partitionBy("year", "month", "day").parquet(
-        output_path
-    )
-    logger.info("Data saved successfully.")
-
+    write_df(output_path, bronze_df, "ignore", ["year", "month", "day"])
     return bronze_df
 
 
@@ -127,12 +143,7 @@ def process_silver_data(bronze_df: DataFrame, output_path: str) -> DataFrame:
     )
 
     # Save the Silver DataFrame
-    logger.info("Saving Silver DataFrame...")
-    silver_df.write.mode("overwrite").partitionBy("year", "month", "day").parquet(
-        output_path
-    )
-
-    logger.info("Silver layer processing completed.")
+    write_df(output_path, silver_df, "ignore", ["year", "month", "day"])
     return silver_df
 
 
@@ -156,12 +167,7 @@ def process_sales_data(
     )
 
     # Write the dataset to the Gold layer partitioned by year, month, and day
-    logger.info(f"Writing Sales dataset to {output_path}...")
-    sales_df.write.mode("overwrite").partitionBy("year", "month", "day").parquet(
-        output_path
-    )
-
-    logger.info("Sales dataset written successfully.")
+    write_df(output_path, sales_df, "overwrite", ["year", "month", "day"])
 
 
 def process_gold_customer(
@@ -178,8 +184,13 @@ def process_gold_customer(
 
     customer_df = add_metadata_columns(silver_df, output_path)
 
-    # Define the reference date (dataset's latest day)
-    reference_date = F.lit("2018-12-30").cast("date")
+    latest_date_row = silver_df.agg(F.max("order_date").alias("latest_date")).collect()[
+        0
+    ]
+    latest_date = latest_date_row["latest_date"]
+    reference_date = F.lit(latest_date)
+
+    logger.debug(f"Last date in the dataset: {latest_date}")
 
     # Calculate quantities for different time ranges
     customer_df = customer_df.groupBy(
@@ -203,8 +214,7 @@ def process_gold_customer(
         ).alias("quantity_last_12_months"),
     )
 
-    logger.info(f"Writing Customer dataset to {output_path}...")
-    customer_df.write.mode("overwrite").parquet(output_path)
+    write_df(output_path, customer_df, "overwrite", None)
 
 
 def main(args: argparse.Namespace) -> None:
